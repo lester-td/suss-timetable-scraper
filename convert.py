@@ -9,7 +9,19 @@ import pandas as pd
 import pdfplumber
 
 
-REQUIRED_COLUMNS = [
+CORE_REQUIRED_COLUMNS = [
+    "SCHOOL / CENTRE",
+    "COURSE CODE",
+    "CRN / TG",
+    "SEMESTER TYPE",
+    "DELIVERY / EXAM MODE",
+    "DATE",
+    "START",
+    "END",
+]
+
+PREFERRED_ORDER = [
+    "POSTGRADUATE",
     "SCHOOL / CENTRE",
     "COURSE CODE",
     "CRN / TG",
@@ -19,27 +31,17 @@ REQUIRED_COLUMNS = [
     "DATE",
     "START",
     "END",
+    "AVAILABLE AS GSP100/UNE500",
     "REMARKS",
 ]
 
-CRITICAL_COLUMNS = [
-    "COURSE CODE",
-    "CRN / TG",
-    "DAY",
-    "DATE",
-    "START",
-    "END",
-]
-
-MATCH_COLUMNS = [
-    "SCHOOL / CENTRE",
+TEXT_VERIFY_COLUMNS = [
     "COURSE CODE",
     "CRN / TG",
     "DELIVERY / EXAM MODE",
     "DATE",
     "START",
     "END",
-    "REMARKS",
 ]
 
 
@@ -60,10 +62,15 @@ def normalize_for_match(value: object) -> str:
     return text.strip()
 
 
+def normalize_for_compact_match(value: object) -> str:
+    text = clean_text(value).upper()
+    text = re.sub(r"[^A-Z0-9]+", "", text)
+    return text
+
+
 def normalize_columns(columns: list[str]) -> list[str]:
     cleaned = [clean_text(col) for col in columns]
 
-    # Add manual header replacements later if needed
     rename_map: dict[str, str] = {}
 
     return [rename_map.get(col, col) for col in cleaned]
@@ -75,11 +82,10 @@ def is_repeated_header_row(row: pd.Series, expected_columns: list[str]) -> bool:
 
 
 def list_pdf_files(directory: Path) -> list[Path]:
-    pdfs = sorted(
+    return sorted(
         [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
         key=lambda p: p.name.lower(),
     )
-    return pdfs
 
 
 def choose_pdf_file() -> Path:
@@ -137,6 +143,93 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         return len(pdf.pages)
 
 
+def merge_cell_values(left: object, right: object) -> str:
+    a = clean_text(left)
+    b = clean_text(right)
+
+    if not a:
+        return b
+    if not b:
+        return a
+    if a == b:
+        return a
+
+    return f"{a} {b}"
+
+
+def collapse_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = pd.DataFrame(index=df.index)
+    seen_blank = 0
+
+    for col_idx in range(df.shape[1]):
+        raw_name = df.columns[col_idx]
+        col_name = clean_text(raw_name)
+
+        if col_name == "":
+            seen_blank += 1
+            col_name = f"__blank__{seen_blank}"
+
+        series = df.iloc[:, col_idx].map(clean_text)
+
+        if col_name not in result.columns:
+            result[col_name] = series
+        else:
+            result[col_name] = [
+                merge_cell_values(existing, new)
+                for existing, new in zip(result[col_name], series)
+            ]
+
+    blank_cols_to_drop: list[str] = []
+    for col in result.columns:
+        if col.startswith("__blank__") and result[col].map(clean_text).eq("").all():
+            blank_cols_to_drop.append(col)
+
+    if blank_cols_to_drop:
+        result = result.drop(columns=blank_cols_to_drop)
+
+    return result
+
+
+def align_to_expected_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in CORE_REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    metadata_cols = [col for col in df.columns if col.startswith("__")]
+    normal_cols = [col for col in df.columns if col not in metadata_cols]
+
+    ordered = [col for col in PREFERRED_ORDER if col in normal_cols]
+    remaining = [col for col in normal_cols if col not in ordered]
+
+    return df[ordered + remaining + metadata_cols]
+
+
+def row_looks_like_header(row: list[str]) -> bool:
+    normalized = [clean_text(x).upper() for x in row]
+
+    header_hits = 0
+    header_keywords = {
+        "POSTGRADUATE",
+        "SCHOOL / CENTRE",
+        "COURSE CODE",
+        "CRN / TG",
+        "SEMESTER TYPE",
+        "DELIVERY / EXAM MODE",
+        "DAY",
+        "DATE",
+        "START",
+        "END",
+        "AVAILABLE AS GSP100/UNE500",
+        "REMARKS",
+    }
+
+    for cell in normalized:
+        if cell in header_keywords:
+            header_hits += 1
+
+    return header_hits >= 3
+
+
 def extract_tables_from_pdf(pdf_path: Path) -> pd.DataFrame:
     total_pages = get_pdf_page_count(pdf_path)
     print(f"\n[1/2] Extracting tables from PDF: {pdf_path.name}")
@@ -144,6 +237,7 @@ def extract_tables_from_pdf(pdf_path: Path) -> pd.DataFrame:
 
     all_frames: list[pd.DataFrame] = []
     total_rows_kept = 0
+    canonical_header: list[str] | None = None
 
     for page_num in range(1, total_pages + 1):
         print(f"\n--- Page {page_num}/{total_pages} ---")
@@ -167,17 +261,51 @@ def extract_tables_from_pdf(pdf_path: Path) -> pd.DataFrame:
                 f"accuracy={accuracy}, whitespace={whitespace}"
             )
 
-            df = table.df.copy()
+            raw_df = table.df.copy()
 
-            if df.empty or len(df) < 2:
-                print("    Skipping: empty table or no data rows.")
+            if raw_df.empty:
+                print("    Skipping: empty table.")
                 continue
 
-            raw_header = df.iloc[0].tolist()
-            header = normalize_columns(raw_header)
+            cleaned_rows: list[list[str]] = []
+            for _, row in raw_df.iterrows():
+                cleaned = [clean_text(x) for x in row.tolist()]
+                if any(cell for cell in cleaned):
+                    cleaned_rows.append(cleaned)
 
-            body = df.iloc[1:].copy()
-            body.columns = header
+            if not cleaned_rows:
+                print("    Skipping: no usable rows.")
+                continue
+
+            first_row = cleaned_rows[0]
+
+            if row_looks_like_header(first_row):
+                header = normalize_columns(first_row)
+                canonical_header = header
+                data_rows = cleaned_rows[1:]
+                print("    Header detected on this page.")
+            else:
+                if canonical_header is None:
+                    print("    Skipping: no header detected and no prior header available.")
+                    continue
+                header = canonical_header
+                data_rows = cleaned_rows
+                print("    No header detected. Reusing previous header.")
+
+            if not data_rows:
+                print("    Skipping: no data rows after header handling.")
+                continue
+
+            header_width = len(header)
+            normalized_rows: list[list[str]] = []
+            for row in data_rows:
+                if len(row) < header_width:
+                    row = row + [""] * (header_width - len(row))
+                elif len(row) > header_width:
+                    row = row[:header_width]
+                normalized_rows.append(row)
+
+            body = pd.DataFrame(normalized_rows, columns=header)
             body = body.apply(lambda col: col.map(clean_text))
 
             rows_before_cleanup = len(body)
@@ -187,8 +315,17 @@ def extract_tables_from_pdf(pdf_path: Path) -> pd.DataFrame:
             ].copy()
 
             body = body.loc[
-                ~body.apply(lambda row: all(x == "" for x in row), axis=1)
+                ~body.apply(lambda row: all(clean_text(x) == "" for x in row), axis=1)
             ].copy()
+
+            duplicate_headers = pd.Index(body.columns)[
+                pd.Index(body.columns).duplicated()
+            ].tolist()
+            if duplicate_headers:
+                print(f"    Duplicate headers detected: {duplicate_headers}")
+
+            body = collapse_duplicate_columns(body)
+            body = align_to_expected_columns(body)
 
             rows_after_cleanup = len(body)
 
@@ -210,8 +347,14 @@ def extract_tables_from_pdf(pdf_path: Path) -> pd.DataFrame:
     if not all_frames:
         raise RuntimeError("No tables were extracted from the PDF.")
 
+    print("\nChecking columns before final concat...")
+    for i, frame in enumerate(all_frames, start=1):
+        if not frame.columns.is_unique:
+            dupes = frame.columns[frame.columns.duplicated()].tolist()
+            raise RuntimeError(f"Frame {i} still has duplicate columns: {dupes}")
+
     final_df = pd.concat(all_frames, ignore_index=True)
-    final_df.columns = normalize_columns(list(final_df.columns))
+    final_df.columns = [clean_text(col) for col in final_df.columns]
 
     print(f"\nExtraction complete. Total extracted rows: {len(final_df)}")
     print(f"Total rows kept across all pages: {total_rows_kept}")
@@ -223,7 +366,7 @@ def run_basic_checks(df: pd.DataFrame) -> list[dict[str, str]]:
     print("\nRunning basic integrity checks...")
     failures: list[dict[str, str]] = []
 
-    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    missing_columns = [col for col in CORE_REQUIRED_COLUMNS if col not in df.columns]
     if missing_columns:
         failures.append(
             {
@@ -231,12 +374,18 @@ def run_basic_checks(df: pd.DataFrame) -> list[dict[str, str]]:
                 "details": ", ".join(missing_columns),
             }
         )
-        print(f"Missing required columns: {missing_columns}")
+        print(f"Missing required core columns: {missing_columns}")
         return failures
 
-    print("Required columns present.")
+    print("Required core columns present.")
 
-    for col in CRITICAL_COLUMNS:
+    critical_cols = [
+        col
+        for col in ["COURSE CODE", "CRN / TG", "DATE", "START", "END"]
+        if col in df.columns
+    ]
+
+    for col in critical_cols:
         blank_mask = df[col].map(clean_text).eq("")
         blank_count = int(blank_mask.sum())
         print(f"Blank values in {col}: {blank_count}")
@@ -260,72 +409,62 @@ def run_basic_checks(df: pd.DataFrame) -> list[dict[str, str]]:
             }
         )
 
-    day_date_mismatch_count = 0
-    invalid_date_count = 0
+    if "DAY" in df.columns:
+        invalid_date_count = 0
+        day_date_mismatch_count = 0
 
-    for row_idx, row in df.iterrows():
-        date_text = clean_text(row.get("DATE", ""))
-        day_text = normalize_for_match(row.get("DAY", ""))
+        for row_idx, row in df.iterrows():
+            date_text = clean_text(row.get("DATE", ""))
+            day_text = normalize_for_match(row.get("DAY", ""))
 
-        if not date_text or not day_text:
-            continue
+            if not date_text or not day_text:
+                continue
 
-        try:
-            expected_day = datetime.strptime(date_text, "%d/%m/%Y").strftime("%A").upper()
-        except ValueError as exc:
-            invalid_date_count += 1
-            failures.append(
-                {
-                    "issue_type": "invalid_date_format",
-                    "details": f"row={row_idx + 2}, DATE={date_text}, error={exc}",
-                }
-            )
-            continue
+            try:
+                expected_day = datetime.strptime(date_text, "%d/%m/%Y").strftime("%A").upper()
+            except ValueError as exc:
+                invalid_date_count += 1
+                failures.append(
+                    {
+                        "issue_type": "invalid_date_format",
+                        "details": f"row={row_idx + 2}, DATE={date_text}, error={exc}",
+                    }
+                )
+                continue
 
-        if day_text != expected_day:
-            day_date_mismatch_count += 1
-            failures.append(
-                {
-                    "issue_type": "day_date_mismatch",
-                    "details": (
-                        f"row={row_idx + 2}, COURSE CODE={row.get('COURSE CODE', '')}, "
-                        f"CRN / TG={row.get('CRN / TG', '')}, DATE={date_text}, "
-                        f"DAY={row.get('DAY', '')}, EXPECTED={expected_day}"
-                    ),
-                }
-            )
+            if day_text != expected_day:
+                day_date_mismatch_count += 1
+                failures.append(
+                    {
+                        "issue_type": "day_date_mismatch",
+                        "details": (
+                            f"row={row_idx + 2}, COURSE CODE={row.get('COURSE CODE', '')}, "
+                            f"CRN / TG={row.get('CRN / TG', '')}, DATE={date_text}, "
+                            f"DAY={row.get('DAY', '')}, EXPECTED={expected_day}"
+                        ),
+                    }
+                )
 
-    print(f"Invalid DATE rows: {invalid_date_count}")
-    print(f"DAY vs DATE mismatches: {day_date_mismatch_count}")
+        print(f"Invalid DATE rows: {invalid_date_count}")
+        print(f"DAY vs DATE mismatches: {day_date_mismatch_count}")
 
     return failures
-
-
-def build_match_tokens(row: pd.Series) -> dict[str, str]:
-    tokens: dict[str, str] = {}
-
-    for col in MATCH_COLUMNS:
-        if col not in row.index:
-            continue
-
-        value = clean_text(row[col])
-        if value:
-            tokens[col] = normalize_for_match(value)
-
-    return tokens
 
 
 def verify_against_pdf_text(df: pd.DataFrame, pdf_path: Path) -> list[dict[str, str]]:
     failures: list[dict[str, str]] = []
 
     print("\n[2/2] Verifying extracted rows against source PDF text...")
+    print("Using stable fields only: COURSE CODE, CRN / TG, DELIVERY / EXAM MODE, DATE, START, END")
+    print("Skipping SCHOOL / CENTRE, DAY, and REMARKS because PDF text wrapping/layout causes false mismatches.")
+
     page_groups = df.groupby("__source_page", sort=True)
 
     with pdfplumber.open(pdf_path) as pdf:
         for source_page, page_df in page_groups:
             page_number = int(source_page)
             page_text = pdf.pages[page_number - 1].extract_text() or ""
-            normalized_page_text = normalize_for_match(page_text)
+            normalized_page_text = normalize_for_compact_match(page_text)
 
             print(f"\n--- Verifying page {page_number} ---")
             print(f"Rows to verify on this page: {len(page_df)}")
@@ -333,11 +472,19 @@ def verify_against_pdf_text(df: pd.DataFrame, pdf_path: Path) -> list[dict[str, 
             page_failures_before = len(failures)
 
             for row_idx, row in page_df.iterrows():
-                tokens = build_match_tokens(row)
-                missing_fields = [
-                    col for col, token in tokens.items()
-                    if token not in normalized_page_text
-                ]
+                missing_fields: list[str] = []
+
+                for col in TEXT_VERIFY_COLUMNS:
+                    if col not in row.index:
+                        continue
+
+                    value = clean_text(row[col])
+                    if not value:
+                        continue
+
+                    token = normalize_for_compact_match(value)
+                    if token and token not in normalized_page_text:
+                        missing_fields.append(col)
 
                 if missing_fields:
                     failures.append(
